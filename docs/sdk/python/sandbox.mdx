@@ -649,6 +649,8 @@ Plan or apply a configuration change. The returned plan uses [`ModificationDispo
 
 Secret specs are keyed by stable secret name. Each `SecretModifySpec` selects at most one source (`env`, `value`, or `store`) and may also set the placeholder, allowed hosts, substitution locations, violation action, TLS identity requirement, and placeholder passthrough hosts; omitting a source updates only the other supplied fields. Plans expose only safe references and metadata; raw secret values never appear in a plan. Removal is explicit through `secrets_rm`.
 
+Changing an existing secret's substitution, violation action, TLS identity requirement, or placeholder passthrough hosts requires a restart on a running sandbox, including when combined with rotation or allowed-host changes. Use `policy=ModificationPolicy.RESTART` to restart and apply, or `policy=ModificationPolicy.NEXT_START` to save for the next start. The default `NO_RESTART` policy rejects these changes before applying them. Identical explicit settings and omitted options leave the existing policy unchanged. Policy-only edits appear as `ConfigPlannedChange` entries with field `secret.<name>.policy`; rotations and allowed-host changes retain their secret change types and are marked as requiring restart when the policy also changes.
+
 The returned [`SandboxModificationPlan`](#sandboxmodificationplan) is a typed dictionary:
 
 | Key | Type | Description |
@@ -2036,7 +2038,7 @@ Desired state for one secret. `env`, `value`, and `store` are mutually exclusive
 | `passthrough` | `Sequence[str]` | Deprecated alias for `allow_placeholder_for`. Nonempty values emit `DeprecationWarning`; when both keys are supplied, their sequences are combined |
 
 ```python
-from microsandbox import SecretSubstitution, ViolationAction
+from microsandbox import ModificationPolicy, SecretSubstitution, ViolationAction
 
 await sb.modify(secrets={
     "API_KEY": {
@@ -2047,7 +2049,7 @@ await sb.modify(secrets={
         "require_tls_identity": True,
         "allow_placeholder_for": ["logs.example.com"],
     },
-})
+}, policy=ModificationPolicy.RESTART)
 ```
 
 ### SandboxModificationPlan
