@@ -1,7 +1,9 @@
 //! Preserve Java's existing trust roots while adding the interception CA.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::ffi::CString;
+use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,6 +18,7 @@ use std::{env, fs, thread};
 const CA_ALIAS: &str = "microsandbox-intercept-ca";
 const STORE_PASSWORD: &str = "changeit";
 const KEYTOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const JAVA_IMPORT_BUDGET: Duration = Duration::from_secs(30);
 const JAVA_ROOTS: &[&str] = &["/usr/lib/jvm", "/usr/java", "/opt/java", "/opt/jdk"];
 const SYSTEM_STORES: &[&str] = &["/etc/ssl/certs/java/cacerts", "/etc/pki/java/cacerts"];
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -26,6 +29,12 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// A sibling file ensures publication uses a rename on the same filesystem.
 struct StoreCopy(PathBuf);
+
+/// Includes POSIX access ACLs and security labels, stored as Linux xattrs.
+struct StoreAttribute {
+    name: CString,
+    value: Vec<u8>,
+}
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -73,6 +82,7 @@ impl Drop for StoreCopy {
 //--------------------------------------------------------------------------------------------------
 
 pub(super) fn install_ca_cert(ca_path: &Path) {
+    let deadline = Instant::now() + JAVA_IMPORT_BUDGET;
     let stores = discover_stores();
     if stores.is_empty() {
         eprintln!(
@@ -80,8 +90,21 @@ pub(super) fn install_ca_cert(ca_path: &Path) {
             ca_path.display()
         );
     }
-    for (store, keytool) in stores {
-        match import_ca(&keytool, &store, ca_path, KEYTOOL_TIMEOUT) {
+    install_into_stores(stores, ca_path, deadline);
+}
+
+fn install_into_stores(stores: BTreeMap<PathBuf, PathBuf>, ca_path: &Path, deadline: Instant) {
+    let count = stores.len();
+    for (index, (store, keytool)) in stores.into_iter().enumerate() {
+        if remaining_time(deadline).is_err() {
+            eprintln!(
+                "tls: Java CA import time budget exhausted; {} remaining trust stores need manual CA import from {}",
+                count - index,
+                ca_path.display()
+            );
+            break;
+        }
+        match import_ca(&keytool, &store, ca_path, deadline) {
             Ok(()) => eprintln!(
                 "tls: installed interception CA into Java trust store {}",
                 store.display()
@@ -178,7 +201,8 @@ fn installation_store(home: &Path) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-fn import_ca(keytool: &Path, store: &Path, ca: &Path, timeout: Duration) -> io::Result<()> {
+fn import_ca(keytool: &Path, store: &Path, ca: &Path, deadline: Instant) -> io::Result<()> {
+    remaining_time(deadline)?;
     // Never attempt to rewrite immutable Nix packages, even as root.
     if store.starts_with("/nix/store") {
         return Err(io::Error::new(
@@ -186,7 +210,8 @@ fn import_ca(keytool: &Path, store: &Path, ca: &Path, timeout: Duration) -> io::
             "Nix trust store is immutable",
         ));
     }
-    let metadata = fs::metadata(store)?;
+    let mut original = fs::File::open(store)?;
+    let metadata = original.metadata()?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o222 == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -196,16 +221,15 @@ fn import_ca(keytool: &Path, store: &Path, ca: &Path, timeout: Duration) -> io::
     let parent = store
         .parent()
         .ok_or_else(|| io::Error::other("trust store has no parent"))?;
+    let attributes = read_store_attributes(&original)?;
     let (copy, mut file) = StoreCopy::create(parent)?;
-    file.write_all(&fs::read(store)?)?;
-    // Preserve guest ownership and mode; do not change the original symlink.
-    std::os::unix::fs::chown(&copy.0, Some(metadata.uid()), Some(metadata.gid()))?;
-    fs::set_permissions(&copy.0, metadata.permissions())?;
+    io::copy(&mut original, &mut file)?;
+    // Keep the staging copy private until keytool has finished writing it.
     drop(file);
 
-    let listed = run_keytool(keytool, &copy.0, &["-list", "-alias", CA_ALIAS], timeout)?;
+    let listed = run_keytool(keytool, &copy.0, &["-list", "-alias", CA_ALIAS], deadline)?;
     if listed {
-        require_keytool(keytool, &copy.0, &["-delete", "-alias", CA_ALIAS], timeout)?;
+        require_keytool(keytool, &copy.0, &["-delete", "-alias", CA_ALIAS], deadline)?;
     }
     let ca = ca
         .to_str()
@@ -214,11 +238,26 @@ fn import_ca(keytool: &Path, store: &Path, ca: &Path, timeout: Duration) -> io::
         keytool,
         &copy.0,
         &["-importcert", "-noprompt", "-alias", CA_ALIAS, "-file", ca],
-        timeout,
+        deadline,
     )?;
+    publish_store(&copy, store, &metadata, &attributes, deadline)
+}
+
+fn publish_store(
+    copy: &StoreCopy,
+    store: &Path,
+    metadata: &fs::Metadata,
+    attributes: &[StoreAttribute],
+    deadline: Instant,
+) -> io::Result<()> {
+    remaining_time(deadline)?;
     std::os::unix::fs::chown(&copy.0, Some(metadata.uid()), Some(metadata.gid()))?;
     fs::set_permissions(&copy.0, metadata.permissions())?;
-    fs::File::open(&copy.0)?.sync_all()?;
+    let staged = fs::File::open(&copy.0)?;
+    // Restore ACLs after chmod, which otherwise changes their access mask.
+    restore_store_attributes(&staged, attributes)?;
+    staged.sync_all()?;
+    remaining_time(deadline)?;
     fs::rename(&copy.0, store)?;
     Ok(())
 }
@@ -227,9 +266,9 @@ fn require_keytool(
     keytool: &Path,
     store: &Path,
     args: &[&str],
-    timeout: Duration,
+    deadline: Instant,
 ) -> io::Result<()> {
-    if run_keytool(keytool, store, args, timeout)? {
+    if run_keytool(keytool, store, args, deadline)? {
         Ok(())
     } else {
         Err(io::Error::other(
@@ -238,7 +277,9 @@ fn require_keytool(
     }
 }
 
-fn run_keytool(keytool: &Path, store: &Path, args: &[&str], timeout: Duration) -> io::Result<bool> {
+fn run_keytool(keytool: &Path, store: &Path, args: &[&str], deadline: Instant) -> io::Result<bool> {
+    let command_deadline = deadline.min(Instant::now() + KEYTOOL_TIMEOUT);
+    remaining_time(command_deadline)?;
     let mut child = Command::new(keytool)
         .args(args)
         .arg("-keystore")
@@ -252,11 +293,12 @@ fn run_keytool(keytool: &Path, store: &Path, args: &[&str], timeout: Duration) -
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status.success()),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) if Instant::now() < command_deadline => {
+                thread::sleep(Duration::from_millis(10))
+            }
             result => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -272,6 +314,118 @@ fn run_keytool(keytool: &Path, store: &Path, args: &[&str], timeout: Duration) -
     }
 }
 
+fn remaining_time(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Java CA import time budget exhausted; original trust store was preserved",
+            )
+        })
+}
+
+fn read_store_attributes(file: &fs::File) -> io::Result<Vec<StoreAttribute>> {
+    let names = list_store_attributes(file)?;
+    names
+        .into_iter()
+        .map(|name| {
+            let value = read_attribute_bytes(|buffer, length| {
+                // SAFETY: file and name are valid; the buffer has length writable bytes.
+                unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), buffer.cast(), length) }
+            })?;
+            Ok(StoreAttribute { name, value })
+        })
+        .collect()
+}
+
+fn list_store_attributes(file: &fs::File) -> io::Result<Vec<CString>> {
+    let names = match read_attribute_bytes(|buffer, length| {
+        // SAFETY: file is valid and the buffer has length writable bytes.
+        unsafe { libc::flistxattr(file.as_raw_fd(), buffer.cast(), length) }
+    }) {
+        Ok(names) => names,
+        // Filesystems without xattr support cannot hold ACLs or labels either.
+        Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| CString::new(name).map_err(io::Error::other))
+        .collect()
+}
+
+fn read_attribute_bytes(
+    mut read: impl FnMut(*mut u8, usize) -> libc::ssize_t,
+) -> io::Result<Vec<u8>> {
+    // Bound retries if another process continuously changes the xattrs.
+    for _ in 0..8 {
+        let length = read(std::ptr::null_mut(), 0);
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let mut bytes = vec![0; length as usize];
+        let actual = read(bytes.as_mut_ptr(), bytes.len());
+        if actual >= 0 {
+            bytes.truncate(actual as usize);
+            return Ok(bytes);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ERANGE) {
+            return Err(error);
+        }
+    }
+    Err(io::Error::other(
+        "Java trust-store attributes kept changing",
+    ))
+}
+
+fn restore_store_attributes(file: &fs::File, attributes: &[StoreAttribute]) -> io::Result<()> {
+    let current = read_store_attributes(file)?;
+    // Remove ACLs or labels inherited from the staging directory when the
+    // original store did not have them, rather than adding extra access rules.
+    for inherited in &current {
+        if !attributes
+            .iter()
+            .any(|attribute| attribute.name == inherited.name)
+        {
+            // SAFETY: file is valid and name is NUL-terminated.
+            let result = unsafe { libc::fremovexattr(file.as_raw_fd(), inherited.name.as_ptr()) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    for attribute in attributes {
+        // Identical inherited labels need no relabel permission.
+        if current
+            .iter()
+            .any(|existing| existing.name == attribute.name && existing.value == attribute.value)
+        {
+            continue;
+        }
+        // SAFETY: file/name are valid; value points to value.len() readable bytes.
+        let result = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                attribute.name.as_ptr(),
+                attribute.value.as_ptr().cast(),
+                attribute.value.len(),
+                0,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -280,6 +434,7 @@ fn run_keytool(keytool: &Path, store: &Path, args: &[&str], timeout: Duration) -
 mod tests {
     use std::io::Read;
     use std::os::unix::fs::symlink;
+    use std::os::unix::process::CommandExt;
 
     use super::*;
 
@@ -381,13 +536,19 @@ mod tests {
         let store = dir.write("cacerts", "existing private roots");
         let ca = dir.write("ca.pem", "CA");
         let keytool = dir.keytool("#!/bin/sh\nexit 1\n");
-        assert!(import_ca(&keytool, &store, &ca, KEYTOOL_TIMEOUT).is_err());
+        assert!(import_ca(&keytool, &store, &ca, Instant::now() + KEYTOOL_TIMEOUT).is_err());
         assert_eq!(
             fs::read_to_string(&store).unwrap(),
             "existing private roots"
         );
         dir.keytool("#!/bin/sh\nexec /bin/sleep 5\n");
-        let error = import_ca(&keytool, &store, &ca, Duration::from_millis(30)).unwrap_err();
+        let error = import_ca(
+            &keytool,
+            &store,
+            &ca,
+            Instant::now() + Duration::from_millis(30),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(
             fs::read_to_string(&store).unwrap(),
@@ -426,7 +587,7 @@ mod tests {
             &keytool,
             &fs::canonicalize(&link).unwrap(),
             &ca,
-            KEYTOOL_TIMEOUT,
+            Instant::now() + KEYTOOL_TIMEOUT,
         )
         .unwrap();
         assert_eq!(fs::read_to_string(&link).unwrap(), "private roots\nmsb CA");
@@ -445,20 +606,166 @@ mod tests {
         let ca = dir.write("ca.pem", "CA");
         let store = dir.write("cacerts", "original");
         fs::set_permissions(&store, fs::Permissions::from_mode(0o444)).unwrap();
-        assert!(import_ca(&keytool, &store, &ca, KEYTOOL_TIMEOUT).is_err());
+        assert!(import_ca(&keytool, &store, &ca, Instant::now() + KEYTOOL_TIMEOUT).is_err());
         assert_eq!(fs::read_to_string(&store).unwrap(), "original");
         assert!(
             import_ca(
                 &keytool,
                 Path::new("/nix/store/jdk/lib/security/cacerts"),
                 &ca,
-                KEYTOOL_TIMEOUT
+                Instant::now() + KEYTOOL_TIMEOUT
             )
             .is_err()
         );
         let missing = dir.0.join("missing");
-        assert!(import_ca(&keytool, &missing, &ca, KEYTOOL_TIMEOUT).is_err());
+        assert!(import_ca(&keytool, &missing, &ca, Instant::now() + KEYTOOL_TIMEOUT).is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn imports_share_one_deadline_across_stores_and_commands() {
+        if isolated("tls::java::tests::imports_share_one_deadline_across_stores_and_commands") {
+            return;
+        }
+        let dir = TestDir::new();
+        let calls = dir.0.join("calls");
+        let keytool = dir.keytool(&format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nexec /bin/sleep 0.2\n",
+            calls.display()
+        ));
+        let ca = dir.write("ca.pem", "CA");
+        let first = dir.write("first-cacerts", "first roots");
+        let second = dir.write("second-cacerts", "second roots");
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let error = import_ca(&keytool, &first, &ca, deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // The second keytool call has only the remaining budget, not another 300ms.
+        let recorded = fs::read_to_string(&calls).unwrap();
+        assert!(
+            recorded == "-list\n" || recorded == "-list\n-delete\n",
+            "unexpected calls: {recorded}"
+        );
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first roots");
+
+        fs::remove_file(&calls).unwrap();
+        let stores = [
+            (first.clone(), keytool.clone()),
+            (second.clone(), keytool.clone()),
+        ]
+        .into();
+        install_into_stores(stores, &ca, Instant::now() + Duration::from_millis(100));
+        assert_eq!(fs::read_to_string(&calls).unwrap(), "-list\n");
+        assert_eq!(fs::read_to_string(first).unwrap(), "first roots");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second roots");
+
+        fs::remove_file(&calls).unwrap();
+        assert_eq!(
+            import_ca(&keytool, &dir.0.join("first-cacerts"), &ca, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(!calls.exists(), "an expired budget must not start keytool");
+    }
+
+    #[test]
+    fn import_preserves_access_acl_and_extended_attributes() {
+        if isolated("tls::java::tests::import_preserves_access_acl_and_extended_attributes") {
+            return;
+        }
+        let dir = TestDir::new();
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let keytool = dir.keytool("#!/bin/sh\noperation=$1\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -keystore ]; then shift; store=$1; fi\n  shift\ndone\n[ \"$operation\" = -list ] && exit 1\nprintf '\\nmsb CA' >> \"$store\"\n");
+        let store = dir.write("cacerts", "private roots");
+        let ca = dir.write("ca.pem", "CA");
+        let file = fs::File::open(&store).unwrap();
+        // Linux POSIX ACL v2: owner rw, named user 65534 r, owning group
+        // none, mask r, other none. Without the ACL, that user cannot read.
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (1u16, 6u16, u32::MAX),
+            (2, 4, 65534),
+            (4, 0, u32::MAX),
+            (16, 4, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        let attributes = [
+            StoreAttribute {
+                name: CString::new("system.posix_acl_access").unwrap(),
+                value: acl,
+            },
+            StoreAttribute {
+                name: CString::new("user.msb-test").unwrap(),
+                value: b"original metadata".to_vec(),
+            },
+        ];
+        restore_store_attributes(&file, &attributes).unwrap();
+        let before = read_store_attributes(&file).unwrap();
+        let assert_reader_access = || {
+            // SAFETY: geteuid has no arguments and no preconditions.
+            if unsafe { libc::geteuid() } == 0 {
+                let result = Command::new("/bin/cat")
+                    .arg(&store)
+                    .uid(65534)
+                    .gid(65534)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        };
+        assert_reader_access();
+        import_ca(&keytool, &store, &ca, Instant::now() + KEYTOOL_TIMEOUT).unwrap();
+        let after = read_store_attributes(&fs::File::open(&store).unwrap()).unwrap();
+        for attribute in before {
+            assert!(after.iter().any(
+                |restored| restored.name == attribute.name && restored.value == attribute.value
+            ));
+        }
+        assert_reader_access();
+        assert_eq!(fs::read_to_string(&store).unwrap(), "private roots\nmsb CA");
+    }
+
+    #[test]
+    fn restoring_attributes_removes_inherited_access_rules_and_reports_failures() {
+        let dir = TestDir::new();
+        let path = dir.write("staged-cacerts", "staged roots");
+        let file = fs::File::open(path).unwrap();
+        let inherited = StoreAttribute {
+            name: CString::new("user.inherited").unwrap(),
+            value: b"not on original store".to_vec(),
+        };
+        restore_store_attributes(&file, &[inherited]).unwrap();
+        restore_store_attributes(&file, &[]).unwrap();
+        assert!(read_store_attributes(&file).unwrap().is_empty());
+        // An invalid namespace is rejected instead of silently losing metadata.
+        let invalid = StoreAttribute {
+            name: CString::new("invalid-namespace").unwrap(),
+            value: Vec::new(),
+        };
+        let original = dir.write("cacerts", "original roots");
+        let metadata = fs::metadata(&original).unwrap();
+        let (copy, handle) = StoreCopy::create(&dir.0).unwrap();
+        drop(handle);
+        fs::write(&copy.0, "new roots").unwrap();
+        assert!(
+            publish_store(
+                &copy,
+                &original,
+                &metadata,
+                &[invalid],
+                Instant::now() + KEYTOOL_TIMEOUT
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(original).unwrap(), "original roots");
     }
 
     #[test]
@@ -477,7 +784,7 @@ mod tests {
                 &root.join("bin/keytool"),
                 &root.join("cacerts"),
                 &root.join("ca.pem"),
-                KEYTOOL_TIMEOUT,
+                Instant::now() + KEYTOOL_TIMEOUT,
             )
             .unwrap();
             let after = ["JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"].map(env::var_os);
@@ -599,7 +906,13 @@ public class TlsProbe {
                 "-file",
                 private_root.to_str().unwrap(),
             ];
-            require_keytool(&keytool, &store, &export_root, KEYTOOL_TIMEOUT).unwrap();
+            require_keytool(
+                &keytool,
+                &store,
+                &export_root,
+                Instant::now() + KEYTOOL_TIMEOUT,
+            )
+            .unwrap();
             let original_root = fs::read(&private_root).unwrap();
             for rotation in 0..2 {
                 if identity.exists() {
@@ -667,27 +980,33 @@ public class TlsProbe {
                     !handshake().status.success(),
                     "untrusted CA accepted before import, rotation={rotation}"
                 );
-                import_ca(&keytool, &store, &ca, KEYTOOL_TIMEOUT).unwrap();
+                import_ca(&keytool, &store, &ca, Instant::now() + KEYTOOL_TIMEOUT).unwrap();
                 let result = handshake();
                 assert!(
                     result.status.success(),
                     "{}",
                     String::from_utf8_lossy(&result.stderr)
                 );
-                import_ca(&keytool, &store, &ca, KEYTOOL_TIMEOUT).unwrap();
+                import_ca(&keytool, &store, &ca, Instant::now() + KEYTOOL_TIMEOUT).unwrap();
                 require_keytool(
                     &keytool,
                     &store,
                     &["-list", "-alias", "private-root"],
-                    KEYTOOL_TIMEOUT,
+                    Instant::now() + KEYTOOL_TIMEOUT,
                 )
                 .unwrap();
-                require_keytool(&keytool, &store, &export_root, KEYTOOL_TIMEOUT).unwrap();
+                require_keytool(
+                    &keytool,
+                    &store,
+                    &export_root,
+                    Instant::now() + KEYTOOL_TIMEOUT,
+                )
+                .unwrap();
                 assert_eq!(fs::read(&private_root).unwrap(), original_root);
             }
             let original = fs::read(&store).unwrap();
             fs::write(&ca, "invalid certificate").unwrap();
-            assert!(import_ca(&keytool, &store, &ca, KEYTOOL_TIMEOUT).is_err());
+            assert!(import_ca(&keytool, &store, &ca, Instant::now() + KEYTOOL_TIMEOUT).is_err());
             assert_eq!(fs::read(&store).unwrap(), original);
 
             require_keytool(
@@ -701,7 +1020,7 @@ public class TlsProbe {
                     "-file",
                     ca.to_str().unwrap(),
                 ],
-                KEYTOOL_TIMEOUT,
+                Instant::now() + KEYTOOL_TIMEOUT,
             )
             .unwrap();
 
@@ -711,11 +1030,13 @@ public class TlsProbe {
                 &keytool,
                 &protected,
                 &["-storepasswd", "-new", "custom-password"],
-                KEYTOOL_TIMEOUT,
+                Instant::now() + KEYTOOL_TIMEOUT,
             )
             .unwrap();
             let original = fs::read(&protected).unwrap();
-            assert!(import_ca(&keytool, &protected, &ca, KEYTOOL_TIMEOUT).is_err());
+            assert!(
+                import_ca(&keytool, &protected, &ca, Instant::now() + KEYTOOL_TIMEOUT).is_err()
+            );
             assert_eq!(fs::read(&protected).unwrap(), original);
         }
     }
