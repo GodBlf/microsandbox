@@ -647,9 +647,9 @@ Plan or apply a configuration change. The returned plan uses [`ModificationDispo
 
 `cpus` and `memory` resize live within the `max_cpus` / `max_memory` ceilings; raising a ceiling requires a restart. `root_disk_size` grows owned managed and flat ext4 roots live, including checkpoint-backed roots, tmpfs root disks can change in either direction on the next boot, and user-supplied disk images are rejected. Env and workdir changes affect future execs only. Stopped roots grow before the new size is saved. Explicit restart and next-start policies remain available.
 
-Secret specs are keyed by stable secret name. Each `SecretModifySpec` selects at most one source (`env`, `value`, or `store`) and may also set the placeholder, allowed hosts, substitution locations, violation action, TLS identity requirement, and placeholder passthrough hosts; omitting a source updates only the other supplied fields. Plans expose only safe references and metadata; raw secret values never appear in a plan. Removal is explicit through `secrets_rm`.
+Secrets are keyed by name. Each `SecretModifySpec` can set one source (`env`, `value`, or `store`) and optional settings listed below. Omitted fields stay unchanged. Plans never include secret values. Use `secrets_rm` to remove secrets.
 
-Changing an existing secret's substitution, violation action, TLS identity requirement, or placeholder passthrough hosts requires a restart on a running sandbox, including when combined with rotation or allowed-host changes. Use `policy=ModificationPolicy.RESTART` to restart and apply, or `policy=ModificationPolicy.NEXT_START` to save for the next start. The default `NO_RESTART` policy rejects these changes before applying them. Identical explicit settings and omitted options leave the existing policy unchanged. Policy-only edits appear as `ConfigPlannedChange` entries with field `secret.<name>.policy`; rotations and allowed-host changes retain their secret change types and are marked as requiring restart when the policy also changes.
+Changing a secret's substitution rules, violation action, TLS identity requirement, or placeholder passthrough hosts requires a restart if the sandbox is running. Use `policy=ModificationPolicy.RESTART` to apply now, or `policy=ModificationPolicy.NEXT_START` to save for the next start. Omitted options keep their current settings.
 
 The returned [`SandboxModificationPlan`](#sandboxmodificationplan) is a typed dictionary:
 
@@ -2036,21 +2036,6 @@ Desired state for one secret. `env`, `value`, and `store` are mutually exclusive
 | `require_tls_identity` | `bool` | Whether substitution requires verified TLS identity. Omission preserves the existing setting; new secrets default to `True`. Explicit `False` disables this requirement |
 | `allow_placeholder_for` | `Sequence[str]` | Hosts permitted to receive unchanged placeholders. A nonempty sequence replaces existing passthrough hosts; an empty sequence leaves them unchanged |
 | `passthrough` | `Sequence[str]` | Deprecated alias for `allow_placeholder_for`. Nonempty values emit `DeprecationWarning`; when both keys are supplied, their sequences are combined |
-
-```python
-from microsandbox import ModificationPolicy, SecretSubstitution, ViolationAction
-
-await sb.modify(secrets={
-    "API_KEY": {
-        "env": "HOST_API_KEY",
-        "allowed_hosts": ["api.example.com"],
-        "substitution": SecretSubstitution(headers=True, query=True),
-        "violation_action": ViolationAction.BLOCK_AND_LOG,
-        "require_tls_identity": True,
-        "allow_placeholder_for": ["logs.example.com"],
-    },
-}, policy=ModificationPolicy.RESTART)
-```
 
 ### SandboxModificationPlan
 
