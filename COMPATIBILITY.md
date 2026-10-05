@@ -112,6 +112,8 @@ Stable guest/VMM identifiers and paths include:
 
 Sources: [`crates/protocol/lib/bootstrap.rs`](crates/protocol/lib/bootstrap.rs), [`crates/protocol/lib/lib.rs`](crates/protocol/lib/lib.rs), [`crates/agentd/lib/agent.rs`](crates/agentd/lib/agent.rs), [`crates/agentd/lib/init.rs`](crates/agentd/lib/init.rs), and [`crates/runtime/lib/runner/vm.rs`](crates/runtime/lib/runner/vm.rs).
 
+Guest TLS interception initialization imports its CA into discovered writable Java trust stores with the installed JDK's `keytool`. This preserves the store's existing entries and leaves workload JVM options and explicitly selected custom stores unchanged. The reserved `microsandbox-intercept-ca` alias is replaced on subsequent starts; Java-owned JKS/PKCS12 encoding is retained. Failed imports do not publish the staged copy. No bootstrap fields, protocol generations, SDK launch arguments, or catalog schemas change. Older hosts and SDKs can use the updated guest without a new wire contract; older agentd binaries and already-running guests retain their previous Java trust behavior. Read-only/Nix stores, non-default passwords, and Java installed after initialization need manual import. Qualification includes actual JDK 17/25 handshakes, retained roots, repeated imports, CA rotation, and failed-import preservation; this does not substitute for the repository's broader v0.6.x SDK/runtime launch qualification.
+
 ## 3. Local Agent IPC and Relay Routing
 
 Unix clients and runtimes recognize canonical hashed socket paths, legacy flat hashed paths, and an older deep sandbox path. Windows uses named pipes derived from the legacy hash. The runtime publishes compatibility symlinks where safe and must not overwrite a live endpoint.

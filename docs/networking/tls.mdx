@@ -86,6 +86,25 @@ Some clients trust a specific certificate or public key instead of the guest's t
 
 Add their hosts to the bypass list. Exact domains such as `api.example.com` and wildcards such as `*.apple.com` are supported. Bypassed traffic stays encrypted between the guest and upstream server, so content-based policy checks and secret injection do not apply.
 
+## Java certificate trust
+
+Java uses a separate trust store, so the PEM bundle used by curl, Python, and Node.js is not sufficient for Java HTTPS requests.
+
+When TLS interception is enabled, microsandbox imports its CA into existing, writable Java trust stores during guest startup. It looks for JDKs through absolute guest `JAVA_HOME` and `PATH` entries, common installation directories (`/usr/lib/jvm`, `/usr/java`, `/opt/java`, and `/opt/jdk`), and SDKMAN's Java candidates directory. If present, `jssecacerts` takes precedence over `cacerts`, as it does in the JVM. Shared distribution stores such as `/etc/ssl/certs/java/cacerts` are also updated when a usable JDK is found.
+
+The import uses the JDK's `keytool` and the standard trust-store password, `changeit`. Existing certificates are retained, and microsandbox does not set or change `JAVA_TOOL_OPTIONS` or explicit `javax.net.ssl.trustStore` settings. Repeated starts replace only the `microsandbox-intercept-ca` entry, including when the interception CA changes. Failed imports leave the original store intact and produce a guest startup diagnostic.
+
+Automatic import requires Java and `keytool` to be installed before startup. Read-only stores, including those inside `/nix/store`, stores with a different password, custom stores selected explicitly by your application, and JDKs installed after startup require manual configuration. Import `/.msb/tls/ca.pem` into the trust store used by that JVM, or configure a writable copy that retains your existing trusted roots. For example, for a writable JDK trust store:
+
+```bash
+"$JAVA_HOME/bin/keytool" -importcert -noprompt \
+  -alias microsandbox-intercept-ca \
+  -file /.msb/tls/ca.pem \
+  -keystore "$JAVA_HOME/lib/security/cacerts"
+```
+
+`keytool` prompts for the trust-store password. If that alias already exists, inspect and remove the previous microsandbox entry before importing the current CA. This automatic import covers the interception CA; host CA shipping alone does not update Java trust stores.
+
 ## Upstream CA trust
 
 The proxy verifies upstream certificates with the host's root store by default. You can add:

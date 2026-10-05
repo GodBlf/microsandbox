@@ -7,12 +7,15 @@
 //! 2. Appends the CA PEM to the system CA bundle.
 //! 3. Sets environment variables (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, etc.)
 //!    so that common runtimes trust the microsandbox CA.
+//! 4. Imports the CA into existing, writable Java trust stores using keytool.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use crate::AgentdResult;
+
+mod java;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -83,6 +86,8 @@ pub fn install_ca_cert() -> AgentdResult<()> {
             microsandbox_protocol::GUEST_TLS_CA_PATH,
         );
     }
+
+    java::install_ca_cert(ca_path);
 
     eprintln!("tls: CA cert installed, bundle={bundle_path}");
     Ok(())
