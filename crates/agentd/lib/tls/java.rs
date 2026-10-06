@@ -1,7 +1,7 @@
 //! Preserve Java's existing trust roots while adding the interception CA.
 
-use std::collections::BTreeMap;
-use std::ffi::CString;
+use std::collections::BTreeSet;
+use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -93,7 +93,7 @@ pub(super) fn install_ca_cert(ca_path: &Path) {
     install_into_stores(stores, ca_path, deadline);
 }
 
-fn install_into_stores(stores: BTreeMap<PathBuf, PathBuf>, ca_path: &Path, deadline: Instant) {
+fn install_into_stores(stores: Vec<(PathBuf, PathBuf)>, ca_path: &Path, deadline: Instant) {
     let count = stores.len();
     for (index, (store, keytool)) in stores.into_iter().enumerate() {
         if remaining_time(deadline).is_err() {
@@ -118,22 +118,13 @@ fn install_into_stores(stores: BTreeMap<PathBuf, PathBuf>, ca_path: &Path, deadl
     }
 }
 
-fn discover_stores() -> BTreeMap<PathBuf, PathBuf> {
+fn discover_stores() -> Vec<(PathBuf, PathBuf)> {
     let mut homes = Vec::new();
     if let Some(home) = env::var_os("JAVA_HOME") {
         homes.push(PathBuf::from(home));
     }
-    // Resolve executable symlinks to discover the selected JDK, including Nix.
     if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path).filter(|path| path.is_absolute()) {
-            for name in ["java", "keytool"] {
-                if let Ok(executable) = fs::canonicalize(directory.join(name))
-                    && let Some(home) = executable.parent().and_then(Path::parent)
-                {
-                    homes.push(home.to_path_buf());
-                }
-            }
-        }
+        homes.extend(homes_from_path(&path));
     }
     for root in JAVA_ROOTS {
         homes.push(PathBuf::from(root));
@@ -147,7 +138,42 @@ fn discover_stores() -> BTreeMap<PathBuf, PathBuf> {
         add_children(&root.join("java"), &mut homes);
     }
 
-    let mut stores = BTreeMap::new();
+    let mut stores = stores_for_homes(homes);
+    // Some distributions keep their shared cacerts outside the JDK directory.
+    if let Some((_, keytool)) = stores.first().cloned() {
+        for path in SYSTEM_STORES {
+            if let Ok(store) = fs::canonicalize(path)
+                && !stores.iter().any(|(existing, _)| *existing == store)
+            {
+                stores.push((store, keytool.clone()));
+            }
+        }
+    }
+    stores
+}
+
+fn homes_from_path(path: &OsStr) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    // Discover Java in PATH order before any keytool-only installations. A
+    // keytool in an earlier directory must not displace the selected JVM.
+    for name in ["java", "keytool"] {
+        for directory in env::split_paths(path).filter(|path| path.is_absolute()) {
+            if let Ok(executable) = fs::canonicalize(directory.join(name))
+                && let Ok(metadata) = fs::metadata(&executable)
+                && metadata.is_file()
+                && metadata.permissions().mode() & 0o111 != 0
+                && let Some(home) = executable.parent().and_then(Path::parent)
+            {
+                homes.push(home.to_path_buf());
+            }
+        }
+    }
+    homes
+}
+
+fn stores_for_homes(homes: Vec<PathBuf>) -> Vec<(PathBuf, PathBuf)> {
+    let mut stores = Vec::new();
+    let mut seen = BTreeSet::new();
     for home in homes {
         if !home.is_absolute() {
             eprintln!(
@@ -156,16 +182,11 @@ fn discover_stores() -> BTreeMap<PathBuf, PathBuf> {
             );
             continue;
         }
-        if let Some((store, keytool)) = installation_store(&home) {
-            stores.entry(store).or_insert(keytool);
-        }
-    }
-    // Some distributions keep their shared cacerts outside the JDK directory.
-    if let Some(keytool) = stores.values().next().cloned() {
-        for path in SYSTEM_STORES {
-            if let Ok(store) = fs::canonicalize(path) {
-                stores.entry(store).or_insert_with(|| keytool.clone());
-            }
+        if let Some((store, keytool)) = installation_store(&home)
+            && seen.insert(store.clone())
+        {
+            // Preserve discovery priority, not the canonical store's path order.
+            stores.push((store, keytool));
         }
     }
     stores
@@ -525,6 +546,62 @@ mod tests {
         assert!(installation_store(&dir.0).is_some());
         fs::set_permissions(dir.0.join("bin/keytool"), fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(installation_store(&dir.0), None);
+    }
+
+    #[test]
+    fn selected_java_home_precedes_path_and_shared_stores_are_deduplicated() {
+        let dir = TestDir::new();
+        let script = "#!/bin/sh\nexit 0\n";
+        let selected_tool = dir.write("z-selected/bin/keytool", script);
+        fs::set_permissions(&selected_tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let selected_store = dir.write("z-selected/lib/security/cacerts", "selected roots");
+        let other_tool = dir.write("a-other/bin/keytool", script);
+        fs::set_permissions(&other_tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let java = dir.write("a-other/bin/java", script);
+        fs::set_permissions(java, fs::Permissions::from_mode(0o755)).unwrap();
+        let other_store = dir.write("a-other/lib/security/cacerts", "other roots");
+        let shared_home = dir.0.join("shared-home");
+        fs::create_dir_all(shared_home.join("bin")).unwrap();
+        fs::create_dir_all(shared_home.join("lib/security")).unwrap();
+        symlink(&other_tool, shared_home.join("bin/keytool")).unwrap();
+        symlink(&selected_store, shared_home.join("lib/security/cacerts")).unwrap();
+        let mut homes = vec![dir.0.join("z-selected")]; // JAVA_HOME is first.
+        homes.extend(homes_from_path(
+            &env::join_paths([dir.0.join("a-other/bin")]).unwrap(),
+        ));
+        homes.push(shared_home);
+        assert_eq!(
+            stores_for_homes(homes),
+            vec![(selected_store, selected_tool), (other_store, other_tool)]
+        );
+    }
+
+    #[test]
+    fn selected_path_java_is_imported_before_slow_unrelated_jdks() {
+        if isolated("tls::java::tests::selected_path_java_is_imported_before_slow_unrelated_jdks") {
+            return;
+        }
+        let dir = TestDir::new();
+        let selected_tool = dir.write("z-selected/bin/keytool", "#!/bin/sh\noperation=$1\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -keystore ]; then shift; store=$1; fi\n  shift\ndone\n[ \"$operation\" = -list ] && exit 1\nprintf '\\nmsb CA' >> \"$store\"\n");
+        fs::set_permissions(selected_tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let java = dir.write("z-selected/bin/java", "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(java, fs::Permissions::from_mode(0o755)).unwrap();
+        let selected = dir.write("z-selected/lib/security/cacerts", "selected roots");
+        let slow_tool = dir.write("a-slow/bin/keytool", "#!/bin/sh\nexec /bin/sleep 5\n");
+        fs::set_permissions(slow_tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let slow = dir.write("a-slow/lib/security/cacerts", "slow roots");
+        // An unrelated keytool comes first in PATH and its store sorts first.
+        let path =
+            env::join_paths([dir.0.join("a-slow/bin"), dir.0.join("z-selected/bin")]).unwrap();
+        let stores = stores_for_homes(homes_from_path(&path));
+        assert_eq!(stores.first().unwrap().0, selected);
+        let ca = dir.write("ca.pem", "CA");
+        install_into_stores(stores, &ca, Instant::now() + Duration::from_millis(300));
+        assert_eq!(
+            fs::read_to_string(selected).unwrap(),
+            "selected roots\nmsb CA"
+        );
+        assert_eq!(fs::read_to_string(slow).unwrap(), "slow roots");
     }
 
     #[test]
