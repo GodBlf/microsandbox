@@ -24,6 +24,14 @@ use microsandbox_types::NetworkRateLimitDirection;
 use crate::ui;
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Bound each range's listener/socket cost while supporting the 1,025-port media use case.
+#[cfg(feature = "net")]
+const MAX_PUBLISHED_PORT_RANGE_SIZE: u32 = 2048;
+
+//--------------------------------------------------------------------------------------------------
 // Functions: Backend resolution
 //--------------------------------------------------------------------------------------------------
 
@@ -2893,6 +2901,7 @@ fn parse_rate(
 ///
 /// IPv6 bind addresses must be bracketed, e.g. `[::]:8080:80`.
 /// HOST and GUEST may be inclusive `START-END` ranges of equal length.
+/// Each specification may expand into at most 2,048 mappings.
 #[cfg(feature = "net")]
 pub(crate) fn parse_port_mapping(spec: &str) -> anyhow::Result<Vec<PublishedPort>> {
     use std::net::{IpAddr, Ipv4Addr};
@@ -2936,10 +2945,15 @@ pub(crate) fn parse_port_mapping(spec: &str) -> anyhow::Result<Vec<PublishedPort
 
     let host = parse_published_port_range(host_str, "host")?;
     let guest = parse_published_port_range(guest_str, "guest")?;
+    let host_count = u32::from(*host.end()) - u32::from(*host.start()) + 1;
+    let guest_count = u32::from(*guest.end()) - u32::from(*guest.start()) + 1;
     anyhow::ensure!(
-        u32::from(*host.end()) - u32::from(*host.start())
-            == u32::from(*guest.end()) - u32::from(*guest.start()),
+        host_count == guest_count,
         "host and guest port ranges must have equal lengths: {host_str}:{guest_str}"
+    );
+    anyhow::ensure!(
+        host_count <= MAX_PUBLISHED_PORT_RANGE_SIZE,
+        "published port range expands to {host_count} mappings; maximum is {MAX_PUBLISHED_PORT_RANGE_SIZE} per specification: {spec}"
     );
 
     Ok(host
@@ -5444,9 +5458,25 @@ mod tests {
         for spec in ["65535:65535-65535", "65535-65535:65535", "0:80"] {
             assert_eq!(parse_port_mapping(spec).unwrap().len(), 1);
         }
-        let ports = parse_port_mapping("1-65535:1-65535").unwrap();
-        assert_eq!(ports.len(), 65535);
-        assert_eq!(ports.last().unwrap().host_port, 65535);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_ranges_enforce_expansion_limit_before_materialization() {
+        for suffix in ["/tcp", "/udp"] {
+            let ports = parse_port_mapping(&format!("1-2048:63488-65535{suffix}")).unwrap();
+            assert_eq!(ports.len(), 2048);
+            assert_eq!(ports.first().unwrap().host_port, 1);
+            assert_eq!(ports.first().unwrap().guest_port, 63488);
+            assert_eq!(ports.last().unwrap().host_port, 2048);
+            assert_eq!(ports.last().unwrap().guest_port, 65535);
+            for spec in ["1-2049:63487-65535", "1-65535:1-65535"] {
+                let error = parse_port_mapping(&format!("{spec}{suffix}")).unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains("maximum is 2048"), "{spec}: {message}");
+                assert!(message.contains(spec), "{spec}: {message}");
+            }
+        }
     }
 
     #[cfg(feature = "net")]

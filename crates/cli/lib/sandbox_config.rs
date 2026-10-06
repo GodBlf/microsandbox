@@ -1944,14 +1944,20 @@ network:
     #[test]
     fn published_port_ranges_reject_invalid_yaml() {
         let dir = tempfile::tempdir().unwrap();
-        let root = write_config(
-            dir.path(),
-            "ports.yaml",
-            "network:\n  ports: [\"8000-8002:80-81\"]\n",
-        );
-        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
-        let error = resolve(&sources).unwrap_err();
-        assert!(error.to_string().contains("equal lengths"), "{error}");
+        for (spec, expected) in [
+            ("8000-8002:80-81", "equal lengths"),
+            ("1-2049:1-2049/udp", "maximum is 2048"),
+        ] {
+            for contents in [
+                format!("network:\n  ports: [\"{spec}\"]\n"),
+                format!("ports: [\"{spec}\"]\n"),
+            ] {
+                let root = write_config(dir.path(), "ports.yaml", &contents);
+                let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+                let error = resolve(&sources).unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+        }
     }
 
     fn write_config(dir: &Path, name: &str, contents: &str) -> PathBuf {
