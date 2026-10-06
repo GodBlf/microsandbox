@@ -63,7 +63,7 @@ pub struct RestoreResourceArgs {
     /// Attach a host disk image (`SOURCE:DEST[:OPTIONS]`), like `create --mount-disk`.
     #[arg(long = "mount-disk", value_name = "SOURCE:DEST[:OPTIONS]")]
     pub mount_disk: Vec<String>,
-    /// Publish a child listener: `[BIND:]HOST:GUEST[/tcp|udp]`.
+    /// Publish child listeners: `[BIND:]HOST:GUEST[/tcp|udp]`, with equal-length port ranges.
     #[cfg(feature = "net")]
     #[arg(short, long)]
     pub port: Vec<String>,
@@ -282,13 +282,13 @@ macro_rules! apply_resources {
                 }
                 #[cfg(feature = "net")]
                 for port in &self.port {
-                    let (bind, host, guest, udp) = parse_port_mapping(port)?;
-                    #[cfg(feature = "net")]
-                    {
-                        builder = if udp {
-                            builder.port_udp_bind(bind, host, guest)
-                        } else {
-                            builder.port_bind(bind, host, guest)
+                    for port in parse_port_mapping(port)? {
+                        builder = match port.protocol {
+                            microsandbox_network::config::PortProtocol::Udp => builder
+                                .port_udp_bind(port.host_bind, port.host_port, port.guest_port),
+                            microsandbox_network::config::PortProtocol::Tcp => {
+                                builder.port_bind(port.host_bind, port.host_port, port.guest_port)
+                            }
                         };
                     }
                 }

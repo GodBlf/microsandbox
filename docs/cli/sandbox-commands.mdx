@@ -128,6 +128,17 @@ Flat roots support pre-boot patches and local snapshots. Patches change only the
 
 Ports bind to `127.0.0.1` by default. Use an explicit address to expose them beyond localhost. Windows may prompt for firewall access.
 
+`--port` (or `-p`) accepts inclusive, equal-length host and guest ranges, paired in ascending order:
+
+```bash
+msb create node --name media -p 0.0.0.0:10240-11264:10240-11264/udp
+msb create node --name services -p 8000-8002:80-82/tcp
+```
+
+The second mapping forwards host ports 8000, 8001, and 8002 to guest ports 80, 81, and 82. TCP is the default; `/udp` selects UDP. IPv6 bind addresses require brackets, for example `[::1]:8000-8002:80-82`. Range endpoints must be from 1 to 65535; reversed ranges and unequal lengths are rejected. The same syntax works with run, create, restore, and fork, and in configuration-file `ports` lists.
+
+Ranges expand into individual mappings. The UDP example opens 1,025 host sockets; large ranges require enough host socket/file-descriptor capacity and consume resources per port. A range does not reserve ports as one atomic block; existing per-port listener startup and error reporting apply.
+
 Each published TCP port's host listener queues up to 1,024 connections that the runtime has not yet accepted. Connections that arrive while the queue is full never reach the sandbox, so a burst larger than the queue — for example a reverse proxy opening one upstream connection per request for a page that loads many assets at once — can fail at the proxy. Set `--tcp-accept-queue-size` to change the depth for every published TCP port of the sandbox:
 
 ```bash
