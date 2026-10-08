@@ -29,8 +29,8 @@ def serve(port, udp):
                 s.sendto(str(port).encode() + b':' + data, peer)
             else:
                 conn, peer = s.accept()
-                with conn:
-                    data = conn.recv(4096)
+                with conn, conn.makefile('rb') as reader:
+                    data = reader.readline().removesuffix(b'\\n')
                     conn.sendall(str(port).encode() + b':' + data)
 for port in range(18080, 18083):
     for udp in (False, True):
@@ -86,7 +86,7 @@ def main():
                             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM if udp else socket.SOCK_STREAM) as sock:
                                 sock.settimeout(1)
                                 sock.connect(('127.0.0.1', host))
-                                sock.sendall(payload)
+                                sock.sendall(payload if udp else payload + b'\n')
                                 if udp:
                                     response = sock.recv(4096)
                                 else:
