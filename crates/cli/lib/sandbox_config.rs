@@ -1946,7 +1946,7 @@ network:
         let dir = tempfile::tempdir().unwrap();
         for (spec, expected) in [
             ("8000-8002:80-81", "equal lengths"),
-            ("1-2049:1-2049/udp", "maximum is 2048"),
+            ("8000-8002:82-80/udp", "guest port range is reversed"),
         ] {
             for contents in [
                 format!("network:\n  ports: [\"{spec}\"]\n"),

@@ -280,7 +280,7 @@ network:
     - "8000-8002:80-82"
 ```
 
-Ranges pair ports in ascending order and expand into individual mappings before launch. Each specification is limited to 2,048 mappings and larger ranges are rejected before expansion. Endpoints must be from 1 to 65535; reversed, malformed, out-of-bounds, and unequal-length ranges are rejected. The first entry opens 1,025 host sockets, so provision host socket/file-descriptor capacity accordingly. See [Published ports](/cli/sandbox-commands#published-ports) for bind addresses and resource considerations.
+Ranges pair ports in ascending order and expand into individual mappings before launch. Endpoints must be from 1 to 65535; reversed, malformed, out-of-bounds, and unequal-length ranges are rejected. The first entry opens 1,025 host sockets, so provision host socket/file-descriptor capacity accordingly. See [Published ports](/cli/sandbox-commands#published-ports) for bind addresses and resource considerations.
 
 ### Secrets
 
